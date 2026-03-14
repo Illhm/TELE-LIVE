@@ -215,6 +215,13 @@ jobs:
                           return info
 
                   print("⚠️ Subtitle Indonesia tidak ditemukan.")
+                  if sub_streams:
+                      s = sub_streams[0]
+                      info["sub_rel_idx"] = 0
+                      info["sub_stream_idx"] = s["index"]
+                      info["sub_codec"] = s.get("codec_name", "ass")
+                      print(f"✅ Fallback to first subtitle track 0 (abs stream #{s['index']})")
+                      return info
               return info
 
           async def main():
