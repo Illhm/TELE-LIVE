@@ -62,7 +62,7 @@ jobs:
           import requests
           from pathlib import Path
           from urllib.parse import urlparse, unquote
-          from telethon import TelegramClient, functions
+          from telethon import TelegramClient, events, functions
           from telethon.sessions import StringSession
           from langdetect import detect, DetectorFactory
           
@@ -224,9 +224,21 @@ jobs:
                   call = await client(functions.phone.GetGroupCallStreamRtmpUrlRequest(peer=ent, revoke=False))
                   rtmp = f"{call.url}{call.key}"
               sub_status = f"✅ Indonesia (Track {info['sub_rel_idx']}) - {info['sub_reason']}" if info['sub_rel_idx'] != -1 else "❌ Nonaktif"
-              msg = f"🎬 **STREAMING DIMULAI**\n\n🏷 **Judul:** `{VIDEO_FILENAME}`\n🎥 **Res:** `{info['res']}` ({info['src_q']})\n⏱ **Durasi:** `{info['dur']}`\n💬 **Sub:** `{sub_status}`\n⚙️ **Output:** `{QUALITY}`"
+              msg = f"🎬 **STREAMING DIMULAI**\n\n🏷 **Judul:** `{VIDEO_FILENAME}`\n🎥 **Res:** `{info['res']}` ({info['src_q']})\n⏱ **Durasi:** `{info['dur']}`\n💬 **Sub:** `{sub_status}`\n⚙️ **Output:** `{QUALITY}`\n\n🔄 *Ketik /ulang untuk merestart stream jika error.*"
               await client.send_message(TARGET_CHAT, msg)
-              await client.disconnect()
+
+              ffmpeg_proc = None
+
+              @client.on(events.NewMessage(pattern=r'(?i)^/ulang', chats=TARGET_CHAT))
+              async def restart_handler(event):
+                  nonlocal ffmpeg_proc
+                  await event.reply("🔄 Memulai ulang stream...")
+                  if ffmpeg_proc and ffmpeg_proc.returncode is None:
+                      try:
+                          ffmpeg_proc.terminate()
+                      except:
+                          pass
+
               last_ts = "00:00:00"
               while True:
                   cmd = ["ffmpeg", "-y"]
@@ -265,12 +277,25 @@ jobs:
                   if rtmp.startswith("rtmps://"):
                       cmd.extend(["-tls_verify", "0"])
                   cmd.append(rtmp)
-                  proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
-                  for line in proc.stdout:
-                      t = re.search(r"time=(\d{2}:\d{2}:\d{2})", line)
+
+                  ffmpeg_proc = await asyncio.create_subprocess_exec(
+                      *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+                  )
+
+                  while True:
+                      line = await ffmpeg_proc.stdout.readline()
+                      if not line:
+                          break
+                      line_str = line.decode('utf-8', errors='ignore')
+                      t = re.search(r"time=(\d{2}:\d{2}:\d{2})", line_str)
                       if t: last_ts = t.group(1)
-                  if proc.wait() == 0: break
+                      if "frame=" in line_str: print(f"\rStreaming: {last_ts}", end="")
+
+                  await ffmpeg_proc.wait()
+                  if ffmpeg_proc.returncode == 0: break
                   await asyncio.sleep(5)
+
+              await client.disconnect()
 
           if __name__ == '__main__': asyncio.run(main())
           EOF

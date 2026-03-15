@@ -60,7 +60,7 @@ jobs:
           import requests
           from pathlib import Path
           from urllib.parse import urlparse, unquote
-          from telethon import TelegramClient, functions
+          from telethon import TelegramClient, events, functions
           from telethon.sessions import StringSession
 
           API_ID = int(os.environ.get("API_ID"))
@@ -204,10 +204,22 @@ jobs:
                   f"⏱ **Durasi:** `{info['dur']}`\n"
                   f"💬 **Subtitle:** `{sub_status}`\n"
                   f"⚙️ **Kualitas Output:** `{QUALITY}`\n\n"
-                  f"🍿 *Selamat menonton! Jangan lupa siapkan camilan.*"
+                  f"🍿 *Selamat menonton! Jangan lupa siapkan camilan.*\n"
+                  f"🔄 *Ketik /ulang untuk merestart stream jika error.*"
               )
               await client.send_message(TARGET_CHAT, pesan)
-              await client.disconnect()
+
+              ffmpeg_proc = None
+
+              @client.on(events.NewMessage(pattern=r'(?i)^/ulang', chats=TARGET_CHAT))
+              async def restart_handler(event):
+                  nonlocal ffmpeg_proc
+                  await event.reply("🔄 Memulai ulang stream...")
+                  if ffmpeg_proc and ffmpeg_proc.returncode is None:
+                      try:
+                          ffmpeg_proc.terminate()
+                      except:
+                          pass
 
               last_ts = "00:00:00"
               while True:
@@ -238,13 +250,24 @@ jobs:
                       cmd.extend(["-tls_verify", "0"])
                   cmd.append(rtmp)
 
-                  proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
-                  for line in proc.stdout:
-                      t = re.search(r"time=(\d{2}:\d{2}:\d{2})", line)
+                  ffmpeg_proc = await asyncio.create_subprocess_exec(
+                      *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+                  )
+
+                  while True:
+                      line = await ffmpeg_proc.stdout.readline()
+                      if not line:
+                          break
+                      line_str = line.decode('utf-8', errors='ignore')
+                      t = re.search(r"time=(\d{2}:\d{2}:\d{2})", line_str)
                       if t: last_ts = t.group(1)
-                      if "frame=" in line: print(f"\rStreaming: {last_ts}", end="")
-                  if proc.wait() == 0: break
+                      if "frame=" in line_str: print(f"\rStreaming: {last_ts}", end="")
+
+                  await ffmpeg_proc.wait()
+                  if ffmpeg_proc.returncode == 0: break
                   await asyncio.sleep(5)
+
+              await client.disconnect()
 
           if __name__ == '__main__':
               asyncio.run(main())
