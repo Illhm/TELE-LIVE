@@ -1,4 +1,4 @@
-name: Stream Ultimate - Unified
+name: Stream 
 
 on:
   workflow_dispatch:
