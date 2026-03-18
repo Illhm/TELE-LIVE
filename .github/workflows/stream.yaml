@@ -249,7 +249,7 @@ jobs:
               @client.on(events.NewMessage(pattern=r'^/ulang', chats=[ent]))
               async def handler(event):
                   global rtmp, current_proc
-                  await event.reply("🔄 Mengulang streaming dan meminta Stream Key baru dari Telegram...")
+                  await event.reply("🔄 Menghentikan stream secara paksa (KILL) dan mereset Stream Key dari Telegram...")
                   if not CUSTOM_RTMP:
                       try:
                           call = await client(functions.phone.GetGroupCallStreamRtmpUrlRequest(peer=ent, revoke=True))
@@ -259,9 +259,11 @@ jobs:
                           return
                   if current_proc:
                       try:
-                          current_proc.terminate()
-                      except:
-                          pass
+                          # --- MENGGUNAKAN KILL() AGAR INSTAN MATI ---
+                          current_proc.kill() 
+                          print("Proses FFmpeg di-KILL secara paksa oleh perintah /ulang!")
+                      except Exception as e:
+                          print(f"Gagal mematikan proses: {e}")
 
               rtmp = CUSTOM_RTMP
               if not rtmp:
@@ -341,7 +343,7 @@ jobs:
                           print(f"\rStreaming: {last_ts}", end="", flush=True)
 
                   await current_proc.wait()
-                  if current_proc.returncode == 0:
+                  if current_proc.returncode == 0 or current_proc.returncode == -9: # Return code -9 adalah efek dari kill()
                       break
                   print("\n⚠️ Stream terputus atau diulang. Mencoba kembali dalam 5 detik...")
                   await asyncio.sleep(5)
@@ -349,6 +351,6 @@ jobs:
               await client.disconnect()
 
           if __name__ == '__main__':
-              asyncio.run(main())
+               asyncio.run(main())
           EOF
           python3 streamer.py
