@@ -1,4 +1,4 @@
-name: Stream 
+name: Stream w
 
 on:
   workflow_dispatch:
@@ -122,10 +122,9 @@ jobs:
                   final_url = f"https://drive.usercontent.com/download?id={file_id}&export=download&confirm={token}"
                   cookies = session.cookies.get_dict()
               
-              # 2. Advanced Filename Extraction (Header -> Redirect -> Fallback)
+              # 2. Advanced Filename Extraction
               try:
                   with requests.get(final_url, cookies=cookies, stream=True, allow_redirects=True, timeout=15) as r:
-                      # Cek Header
                       if 'Content-Disposition' in r.headers:
                           cd = r.headers['Content-Disposition']
                           match = re.findall(r'filename\*?=([^;]+)', cd)
@@ -135,8 +134,6 @@ jobs:
                                   filename = unquote(temp_name[7:])
                               else:
                                   filename = temp_name
-                      
-                      # Jika Header kosong, cek URL final setelah di-redirect
                       if not filename:
                           parsed_url = urlparse(r.url)
                           extracted_path = unquote(Path(parsed_url.path).name)
@@ -145,7 +142,6 @@ jobs:
               except Exception as e:
                   print(f"Peringatan: Gagal ekstrak header ({e})")
               
-              # Fallback akhir jika masih kosong
               if not filename:
                   filename = "video_stream"
                   
@@ -175,7 +171,6 @@ jobs:
                   title = (tags.get("title") or "").lower()
                   if lang in ["ind", "id", "indonesian"]: score += 50
                   if "indo" in title: score += 30
-                  # AI Detection
                   sample = extract_subtitle_sample(video_input, i)
                   if score_indonesian_text(sample) > 0: score += 100
                   if score > best_score:
@@ -193,7 +188,6 @@ jobs:
               
               info = {"sub_rel_idx": -1, "sub_codec": "", "res": "N/A", "dur": "N/A", "size": "N/A"}
               
-              # Get Duration
               duration_sec = float(format_info.get("duration", 0))
               if duration_sec > 0:
                   hrs = int(duration_sec // 3600)
@@ -201,7 +195,6 @@ jobs:
                   secs = int(duration_sec % 60)
                   info["dur"] = f"{hrs:02}:{mins:02}:{secs:02}"
               
-              # Get Resolution
               v_s = [s for s in streams if s.get("codec_type") == "video"]
               if v_s:
                   v = sorted(v_s, key=lambda x: x.get("height", 0), reverse=True)[0]
@@ -259,9 +252,8 @@ jobs:
                           return
                   if current_proc:
                       try:
-                          # --- MENGGUNAKAN KILL() AGAR INSTAN MATI ---
                           current_proc.kill() 
-                          print("Proses FFmpeg di-KILL secara paksa oleh perintah /ulang!")
+                          print("\n[!] Proses FFmpeg di-KILL secara paksa oleh perintah /ulang!")
                       except Exception as e:
                           print(f"Gagal mematikan proses: {e}")
 
@@ -343,10 +335,16 @@ jobs:
                           print(f"\rStreaming: {last_ts}", end="", flush=True)
 
                   await current_proc.wait()
-                  if current_proc.returncode == 0 or current_proc.returncode == -9: # Return code -9 adalah efek dari kill()
+                  
+                  # PERBAIKAN DI SINI: Hanya keluar (break) jika FFmpeg selesai dengan sukses (kode 0)
+                  if current_proc.returncode == 0:
+                      print("\n✅ Video selesai diputar dengan normal.")
                       break
-                  print("\n⚠️ Stream terputus atau diulang. Mencoba kembali dalam 5 detik...")
-                  await asyncio.sleep(5)
+                      
+                  # Jika returncode bukan 0 (termasuk -9 akibat kill), script tidak akan break
+                  # melainkan lanjut me-restart loop while.
+                  print(f"\n⚠️ Stream terhenti (Return Code: {current_proc.returncode}). Memulai ulang koneksi dalam 3 detik...")
+                  await asyncio.sleep(3)
 
               await client.disconnect()
 
