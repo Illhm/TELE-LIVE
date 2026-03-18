@@ -1,0 +1,585 @@
+import asyncio
+import os
+import subprocess
+import re
+import json
+import requests
+from pathlib import Path
+from urllib.parse import urlparse, unquote
+from telethon import TelegramClient, functions, events
+from telethon.sessions import StringSession
+from langdetect import detect, DetectorFactory
+from fractions import Fraction
+import time
+
+DetectorFactory.seed = 0
+
+API_ID = int(os.environ.get("API_ID"))
+API_HASH = os.environ.get("API_HASH")
+STRING_SESSION = os.environ.get("STRING_SESSION")
+TARGET_CHAT = os.environ.get("TARGET_CHAT")
+CUSTOM_RTMP = os.environ.get("CUSTOM_RTMP", "").strip()
+VIDEO_URL = os.environ.get("VIDEO_URL", "").strip()
+QUALITY = os.environ.get("QUALITY", "auto").strip()
+USE_SUBTITLE = os.environ.get("USE_SUBTITLE", "false").lower() == "true"
+SUBTITLE_TRACK = os.environ.get("SUBTITLE_TRACK", "auto").strip().lower()
+
+TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
+
+
+def sanitize(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]+', ' ', name).strip()
+
+
+def ffmpeg_escape_filter_path(path: str) -> str:
+    return (
+        path.replace("\\", "\\\\")
+        .replace(":", r"\:")
+        .replace("'", r"\'")
+        .replace("[", r"\[")
+        .replace("]", r"\]")
+        .replace(",", r"\,")
+    )
+
+
+def clean_sub_text(text: str) -> str:
+    text = re.sub(r'\d+\s*\n', '\n', text)
+    text = re.sub(r'\d{2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{1,3}', ' ', text)
+    text = re.sub(r'\{[^}]*\}', ' ', text)
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'[^\w\s]', ' ', text.lower())
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def score_indonesian_text(text: str) -> int:
+    if not text:
+        return 0
+    cleaned = clean_sub_text(text)
+    if len(cleaned.split()) < 10:
+        return 0
+    try:
+        lang = detect(cleaned)
+        if lang == 'id':
+            return 100
+        elif lang == 'ms':
+            return -50
+    except Exception:
+        pass
+    return 0
+
+
+def parse_fraction(fr: str) -> float:
+    try:
+        fr = (fr or "").strip()
+        if not fr or fr == "0/0":
+            return 0.0
+        if "/" in fr:
+            num, den = fr.split("/", 1)
+            den_f = float(den)
+            if den_f == 0:
+                return 0.0
+            return float(num) / den_f
+        return float(fr)
+    except Exception:
+        return 0.0
+
+
+def snap_fps_value(fps: float) -> Fraction:
+    if fps <= 0:
+        return Fraction(30, 1)
+    common = [
+        Fraction(24000, 1001), Fraction(24, 1),
+        Fraction(25, 1),
+        Fraction(30000, 1001), Fraction(30, 1),
+        Fraction(50, 1),
+        Fraction(60000, 1001), Fraction(60, 1),
+    ]
+    for c in common:
+        if abs(float(c) - fps) < 0.05:
+            return c
+    return Fraction(fps).limit_denominator(1001)
+
+
+def choose_output_fps(fps_in: float) -> Fraction:
+    # cap ke 30 fps kalau sumber >30 agar encoder stabil
+    if fps_in <= 0:
+        return Fraction(30, 1)
+    fps_in_frac = snap_fps_value(fps_in)
+    if float(fps_in_frac) > 30.5:
+        return Fraction(30, 1)
+    return fps_in_frac
+
+
+def calc_vbv_bitrate_kbps(width: int, height: int, fps: float) -> int:
+    if width <= 0 or height <= 0:
+        return 3500
+    pixels = width * height
+    if pixels >= 3840 * 2160:  # 4K
+        return 12000 if fps > 30 else 9000
+    if pixels >= 2560 * 1440:  # 1440p
+        return 8000 if fps > 30 else 6000
+    if pixels >= 1920 * 1080:  # 1080p
+        return 6000 if fps > 30 else 3500
+    if pixels >= 1280 * 720:   # 720p
+        return 4500 if fps > 30 else 2500
+    return 1800
+
+
+def ffmpeg_help(topic: str) -> str:
+    try:
+        p = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-h", topic],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        return (p.stdout or "") + "\n" + (p.stderr or "")
+    except Exception:
+        return ""
+
+
+def detect_rtmp_options() -> set:
+    help_text = ffmpeg_help("protocol=rtmp")
+    opts = set()
+    for key in ["rtmp_buffer", "rtmp_live", "tcp_keepalive", "tcp_nodelay"]:
+        if key in help_text:
+            opts.add(key)
+    if "rw_timeout" in ffmpeg_help("protocols"):
+        opts.add("rw_timeout")
+    return opts
+
+
+RTMP_OPTS = detect_rtmp_options()
+
+
+def get_filename_and_url(url: str):
+    final_url, filename, cookies = url, "", {}
+
+    drive_match = re.search(r'(?:id=|\/d\/)([a-zA-Z0-9_-]{25,})', url)
+    if drive_match:
+        file_id = drive_match.group(1)
+        session = requests.Session()
+        res = session.get("https://drive.google.com/uc?export=download", params={'id': file_id})
+        token = next((v for k, v in session.cookies.get_dict().items() if k.startswith("download_warning")), "")
+        if not token:
+            m = re.search(r'name="confirm" value="([^"]+)"', res.text)
+            token = m.group(1) if m else "t"
+        final_url = f"https://drive.usercontent.com/download?id={file_id}&export=download&confirm={token}"
+        cookies = session.cookies.get_dict()
+
+    try:
+        with requests.get(final_url, cookies=cookies, stream=True, allow_redirects=True, timeout=15) as r:
+            if 'Content-Disposition' in r.headers:
+                cd = r.headers['Content-Disposition']
+                match = re.findall(r'filename\*?=([^;]+)', cd)
+                if match:
+                    temp_name = match[0].strip(' \'"')
+                    if temp_name.lower().startswith("utf-8''"):
+                        filename = unquote(temp_name[7:])
+                    else:
+                        filename = temp_name
+            if not filename:
+                parsed_url = urlparse(r.url)
+                extracted_path = unquote(Path(parsed_url.path).name)
+                if extracted_path:
+                    filename = extracted_path
+    except Exception as e:
+        print(f"Peringatan: Gagal ekstrak header ({e})")
+
+    if not filename:
+        filename = "video_stream"
+
+    filename = sanitize(filename)
+    if not Path(filename).suffix:
+        filename += ".mp4"
+    return filename, final_url, cookies
+
+
+def extract_subtitle_sample(video_input: str, rel_idx: int, custom_headers: str = "") -> str:
+    tmp_path = f"/tmp/subsample_{rel_idx}.srt"
+    try:
+        cmd = ["ffmpeg", "-y", "-nostdin", "-loglevel", "error"]
+        if custom_headers:
+            cmd.extend(["-headers", custom_headers])
+        cmd.extend(["-ss", "300", "-i", video_input, "-map", f"0:s:{rel_idx}", "-c:s", "srt", "-t", "60", tmp_path])
+        subprocess.run(cmd, check=True, timeout=30)
+        with open(tmp_path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception:
+        return ""
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+def detect_indonesian_sub(streams, video_input: str, custom_headers: str = "") -> int:
+    best_idx, best_score = -1, -1
+    sub_s = [s for s in streams if s.get("codec_type") == "subtitle"]
+    for i, s in enumerate(sub_s):
+        score = 0
+        tags = s.get("tags", {}) or {}
+        lang = (tags.get("language") or "").lower()
+        title = (tags.get("title") or "").lower()
+        if lang in ["ind", "id", "indonesian"]:
+            score += 50
+        if "indo" in title:
+            score += 30
+        sample = extract_subtitle_sample(video_input, i, custom_headers=custom_headers)
+        if score_indonesian_text(sample) > 0:
+            score += 100
+        if score > best_score:
+            best_score = score
+            best_idx = i
+    return best_idx if best_score > 10 else -1
+
+
+def ffprobe_json(video_input: str, custom_headers: str = "") -> dict:
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams"]
+    if custom_headers:
+        cmd.extend(["-headers", custom_headers])
+    cmd.append(video_input)
+    out = subprocess.run(cmd, capture_output=True, text=True).stdout
+    try:
+        return json.loads(out or "{}")
+    except Exception:
+        return {}
+
+
+def human_duration(seconds: float) -> str:
+    if not seconds or seconds <= 0:
+        return "N/A"
+    hrs = int(seconds // 3600)
+    mins = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hrs:02}:{mins:02}:{secs:02}"
+
+
+def pick_best_video_stream(streams):
+    v_s = [s for s in streams if s.get("codec_type") == "video"]
+    if not v_s:
+        return None
+    return sorted(v_s, key=lambda x: x.get("height", 0), reverse=True)[0]
+
+
+def has_audio_stream(streams) -> bool:
+    return any(s.get("codec_type") == "audio" for s in streams)
+
+
+def get_stream_data(video_input: str, custom_headers: str):
+    data = ffprobe_json(video_input, custom_headers)
+    streams = data.get("streams", [])
+    format_info = data.get("format", {}) or {}
+
+    info = {
+        "sub_rel_idx": -1,
+        "sub_codec": "",
+        "res": "N/A",
+        "dur": "N/A",
+        "fps_in": 0.0,
+        "fps_out": "30",
+        "width": 0,
+        "height": 0,
+        "has_audio": False,
+        "vbv_kbps": 3500
+    }
+
+    duration_sec = float(format_info.get("duration", 0) or 0)
+    info["dur"] = human_duration(duration_sec)
+
+    v = pick_best_video_stream(streams)
+    if v:
+        w = int(v.get("width") or 0)
+        h = int(v.get("height") or 0)
+        info["width"], info["height"] = w, h
+        if w and h:
+            info["res"] = f"{w}x{h}"
+
+        fps_val = parse_fraction(v.get("avg_frame_rate") or "") or parse_fraction(v.get("r_frame_rate") or "")
+        info["fps_in"] = fps_val
+
+        fps_out = choose_output_fps(fps_val)
+        info["fps_out"] = f"{fps_out.numerator}/{fps_out.denominator}" if fps_out.denominator != 1 else str(fps_out.numerator)
+
+        vw, vh = w, h
+        if QUALITY == "1080p":
+            vw, vh = 1920, 1080
+        info["vbv_kbps"] = calc_vbv_bitrate_kbps(vw, vh, float(fps_out))
+
+    info["has_audio"] = has_audio_stream(streams)
+
+    if USE_SUBTITLE:
+        if SUBTITLE_TRACK.isdigit():
+            rel_idx = int(SUBTITLE_TRACK)
+            info["sub_rel_idx"] = rel_idx
+            sub_s = [s for s in streams if s.get("codec_type") == "subtitle"]
+            if 0 <= rel_idx < len(sub_s):
+                info["sub_codec"] = sub_s[rel_idx].get("codec_name", "")
+        else:
+            info["sub_rel_idx"] = detect_indonesian_sub(streams, video_input, custom_headers=custom_headers) if SUBTITLE_TRACK == "auto" else -1
+            if info["sub_rel_idx"] != -1:
+                sub_s = [s for s in streams if s.get("codec_type") == "subtitle"]
+                if 0 <= info["sub_rel_idx"] < len(sub_s):
+                    info["sub_codec"] = sub_s[info["sub_rel_idx"]].get("codec_name", "")
+
+    return info
+
+
+current_proc = None
+rtmp = ""
+last_ts = "00:00:00"
+
+
+def build_filtergraph(video_input: str, info: dict, has_scale: bool):
+    sub_idx = info.get("sub_rel_idx", -1)
+    sub_codec = info.get("sub_codec", "")
+    filters = []
+
+    v_in = "[0:v:0]"
+    v_out = "[vout]"
+
+    if has_scale:
+        filters.append(f"{v_in}scale=1920:-2{v_out}")
+        v_in = v_out
+        v_out = "[vout2]"
+
+    if sub_idx != -1:
+        if sub_codec in TEXT_SUB_CODECS:
+            esc_path = ffmpeg_escape_filter_path(os.path.abspath(video_input))
+            filters.append(f"{v_in}subtitles=filename='{esc_path}':si={sub_idx}{v_out}")
+        else:
+            if has_scale:
+                filters.append(f"[0:s:{sub_idx}]scale=1920:-2[subv]")
+                sub_label = "[subv]"
+            else:
+                sub_label = f"[0:s:{sub_idx}]"
+            filters.append(f"{v_in}{sub_label}overlay{v_out}")
+
+        v_in = v_out
+        v_out = "[vout3]"
+
+    if filters:
+        final_label = "[vfinal]"
+        filters.append(f"{v_in}format=yuv420p{final_label}")
+        return ";".join(filters), final_label
+
+    return "", "0:v:0"
+
+
+async def main():
+    v_url = VIDEO_URL
+    custom_headers = ""
+    if "|" in v_url:
+        parts = v_url.split("|", 1)
+        v_url = parts[0]
+        h_list = [f"{kv.split('=', 1)[0]}: {kv.split('=', 1)[1]}" for kv in parts[1].split("&") if "=" in kv]
+        if h_list:
+            custom_headers = "\r\n".join(h_list) + "\r\n"
+
+    IS_LOCAL = not (".m3u8" in v_url.lower() or ".m3u" in v_url.lower())
+    if IS_LOCAL:
+        VIDEO_FILENAME, DL_URL, COOKIES = get_filename_and_url(v_url)
+        VIDEO_INPUT = VIDEO_FILENAME
+        c_str = "; ".join([f"{k}={v}" for k, v in COOKIES.items()])
+        cmd = ["aria2c", "-c", "-x", "16", "-s", "16", "-j", "5", "-o", VIDEO_FILENAME, DL_URL]
+        if c_str:
+            cmd.insert(1, f"--header=Cookie: {c_str}")
+        subprocess.run(cmd, check=True)
+    else:
+        VIDEO_INPUT = v_url
+        VIDEO_FILENAME = Path(urlparse(v_url).path).name or "Live Stream / M3U8"
+
+    info = get_stream_data(VIDEO_INPUT, custom_headers)
+
+    global rtmp, current_proc, last_ts
+
+    client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
+    await client.connect()
+    ent = await client.get_entity(TARGET_CHAT)
+
+    @client.on(events.NewMessage(pattern=r'^/ulang', chats=[ent]))
+    async def handler(event):
+        global rtmp, current_proc, last_ts
+        await event.reply("🔄 Menghentikan stream & reset Stream Key...")
+        last_ts = "00:00:00"
+        if not CUSTOM_RTMP:
+            try:
+                call = await client(functions.phone.GetGroupCallStreamRtmpUrlRequest(peer=ent, revoke=True))
+                rtmp = f"{call.url}{call.key}"
+            except Exception as e:
+                await event.reply(f"❌ Gagal reset key: {e}")
+                return
+        if current_proc:
+            try:
+                current_proc.kill()
+                print("\n[!] FFmpeg di-KILL (/ulang)")
+            except Exception as e:
+                print(f"Gagal mematikan proses: {e}")
+
+    rtmp = CUSTOM_RTMP
+    if not rtmp:
+        try:
+            await client(functions.phone.CreateGroupCallRequest(peer=ent, rtmp_stream=True))
+        except Exception:
+            pass
+        call = await client(functions.phone.GetGroupCallStreamRtmpUrlRequest(peer=ent, revoke=False))
+        rtmp = f"{call.url}{call.key}"
+
+    sub_status = f"✅ Aktif (Track {info['sub_rel_idx']} – {info['sub_codec']})" if info['sub_rel_idx'] != -1 else "❌ Tidak ditemukan"
+    source_label = "📥 Local / Cloud" if IS_LOCAL else "🌐 Live URL / M3U8"
+
+    msg = (
+        f"🎬 **NOBAR STREAM STARTED**\n\n"
+        f"📄 **File:** `{VIDEO_FILENAME}`\n"
+        f"🎞️ **Resolusi:** `{info['res']}`\n"
+        f"🎞️ **FPS (in→out):** `{info['fps_in']:.2f} → {info['fps_out']}`\n"
+        f"⏱️ **Durasi:** `{info['dur']}`\n"
+        f"💬 **Subtitle:** {sub_status}\n"
+        f"📡 **Source:** `{source_label}`\n\n"
+        f"🔑 **RTMP URL:**\n`{rtmp}`\n\n"
+        f"⚙️ **Status:** `Streaming is active...`"
+    )
+    await client.send_message(TARGET_CHAT, msg)
+
+    while True:
+        fps_out = choose_output_fps(info["fps_in"])
+        fps_out_f = float(fps_out)
+        gop = max(25, int(round(fps_out_f * 2)))
+        vbv_kbps = int(info.get("vbv_kbps") or 3500)
+
+        preset = "superfast" if (USE_SUBTITLE and info.get("sub_rel_idx", -1) != -1) else "veryfast"
+
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-nostdin", "-loglevel", "info"]
+
+        if IS_LOCAL:
+            cmd.extend(["-re"])
+            if last_ts != "00:00:00":
+                cmd.extend(["-ss", last_ts])
+        else:
+            cmd.extend([
+                "-reconnect", "1",
+                "-reconnect_at_eof", "1",
+                "-reconnect_streamed", "1",
+                "-reconnect_delay_max", "5"
+            ])
+
+        cmd.extend(["-thread_queue_size", "4096"])
+        if custom_headers:
+            cmd.extend(["-headers", custom_headers])
+
+        cmd.extend(["-i", VIDEO_INPUT])
+
+        has_scale = (QUALITY == "1080p")
+        filter_complex, v_map = build_filtergraph(VIDEO_INPUT, info, has_scale=has_scale)
+        if filter_complex:
+            cmd.extend(["-filter_complex", filter_complex, "-map", v_map])
+        else:
+            cmd.extend(["-map", "0:v:0"])
+
+        cmd.extend(["-map", "0:a:0?"])
+
+        cmd.extend([
+            "-c:v", "libx264",
+            "-preset", preset,
+            "-tune", "zerolatency",
+            "-profile:v", "main",
+            "-pix_fmt", "yuv420p",
+            "-r", str(fps_out),
+            "-fps_mode", "cfr",
+            "-g", str(gop),
+            "-keyint_min", str(gop),
+            "-sc_threshold", "0",
+            "-bf", "0",
+            "-b:v", f"{vbv_kbps}k",
+            "-maxrate", f"{vbv_kbps}k",
+            "-bufsize", f"{vbv_kbps * 2}k",
+            "-x264-params", "nal-hrd=cbr:force-cfr=1",
+        ])
+
+        cmd.extend([
+            "-c:a", "aac",
+            "-b:a", "160k",
+            "-ac", "2",
+            "-ar", "44100",
+            "-af", "aresample=async=1:first_pts=0",
+        ])
+
+        cmd.extend([
+            "-max_muxing_queue_size", "2048",
+            "-f", "flv",
+            "-flvflags", "no_duration_filesize",
+        ])
+
+        if "rtmp_live" in RTMP_OPTS:
+            cmd.extend(["-rtmp_live", "live"])
+        if "rtmp_buffer" in RTMP_OPTS:
+            cmd.extend(["-rtmp_buffer", "5000"])
+        if "tcp_keepalive" in RTMP_OPTS:
+            cmd.extend(["-tcp_keepalive", "1"])
+        if "rw_timeout" in RTMP_OPTS:
+            cmd.extend(["-rw_timeout", str(15_000_000)])
+
+        if rtmp.startswith("rtmps://"):
+            cmd.extend(["-tls_verify", "0"])
+
+        cmd.append(rtmp)
+
+        print(f"\n📡 RTMP URL: {rtmp}\n")
+        print(f"[ENC] preset={preset} vbv={vbv_kbps}k gop={gop} fps_out={fps_out} | rtmp_opts={sorted(RTMP_OPTS)}")
+
+        current_proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT
+        )
+
+        last_speed = None
+
+        while True:
+            chunk = await current_proc.stdout.read(4096)
+            if not chunk:
+                break
+            chunk_str = chunk.decode('utf-8', errors='ignore')
+
+            t_matches = re.findall(r"time=(\d{2}:\d{2}:\d{2})", chunk_str)
+            if t_matches:
+                last_ts = t_matches[-1]
+
+            s_match = re.findall(r"speed=\s*([0-9.]+)x", chunk_str)
+            if s_match:
+                try:
+                    last_speed = float(s_match[-1])
+                except Exception:
+                    pass
+
+            if "frame=" in chunk_str:
+                if last_speed is not None:
+                    print(f"\rStreaming: {last_ts} | speed={last_speed:.2f}x", end="", flush=True)
+                else:
+                    print(f"\rStreaming: {last_ts}", end="", flush=True)
+
+        await current_proc.wait()
+
+        if current_proc.returncode == 0:
+            print("\n✅ Video selesai diputar dengan normal.")
+            break
+
+        if not CUSTOM_RTMP:
+            try:
+                call = await client(functions.phone.GetGroupCallStreamRtmpUrlRequest(peer=ent, revoke=False))
+                rtmp = f"{call.url}{call.key}"
+                print("\n🔑 RTMP key refreshed.")
+            except Exception as e:
+                print(f"\n⚠️ Gagal refresh RTMP key: {e}")
+
+        print(f"\n⚠️ Stream terhenti (Return Code: {current_proc.returncode}). Memulai ulang dalam 3 detik...")
+        await asyncio.sleep(3)
+
+    await client.disconnect()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
